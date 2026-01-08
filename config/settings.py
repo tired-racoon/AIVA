@@ -38,23 +38,19 @@ class Settings(BaseModel):
     max_tokens: int = 512
     temperature: float = 0.7
     
-    def __init__(self, **kwargs):
+    @classmethod
+    def get_current(cls):
         config_data = {}
-        for key in self.model_fields.keys():
+        for key in cls.model_fields.keys():
             value = config_manager.get(key)
             if value is not None:
                 config_data[key] = value
-        
-        config_data.update(kwargs)
-        super().__init__(**config_data)
+        return cls(**config_data)
     
     def save(self):
         config_manager.update(self.model_dump())
-    
-    def reload(self):
-        for key in self.model_fields.keys():
-            value = config_manager.get(key)
-            if value is not None:
-                setattr(self, key, value)
 
-settings = Settings()
+def get_settings():
+    return Settings.get_current()
+
+settings = Settings.get_current()

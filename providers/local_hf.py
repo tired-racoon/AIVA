@@ -60,6 +60,8 @@ class LocalHFProvider(BaseLLMProvider):
         messages: List[Dict[str, str]], 
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
+        from config.settings import get_settings
+        settings = get_settings()
         
         if tools:
             system_prompt = self._build_tool_prompt(tools)
@@ -117,19 +119,88 @@ class LocalHFProvider(BaseLLMProvider):
         messages: List[Dict[str, str]], 
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> Iterator[Dict[str, Any]]:
+        from config.settings import get_settings
+        from transformers import TextIteratorStreamer
+        from threading import Thread
         
-        result = self.generate(messages, tools)
+        settings = get_settings()
         
-        if result.get("content"):
+        if tools:
+            system_prompt = self._build_tool_prompt(tools)
+            messages_with_tools = [{"role": "system", "content": system_prompt}] + messages
+        else:
+            messages_with_tools = messages
+        
+        try:
+            text = self.tokenizer.apply_chat_template(
+                messages_with_tools,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except Exception as e:
+            logger.warning(f"Chat template failed: {e}, using fallback")
+            text = "\n\n".join([f"{m['role']}: {m['content']}" for m in messages_with_tools])
+            text += "\n\nassistant:"
+        
+        model_inputs = self.tokenizer([text], return_tensors="pt")
+        
+        if hasattr(self.model, 'device'):
+            model_inputs = model_inputs.to(self.model.device)
+        
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True
+        )
+        
+        generation_kwargs = dict(
+            **model_inputs,
+            max_new_tokens=settings.max_tokens,
+            temperature=settings.temperature,
+            pad_token_id=self.tokenizer.eos_token_id,
+            do_sample=True,
+            streamer=streamer
+        )
+        
+        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.start()
+        
+        accumulated_content = ""
+        
+        try:
+            for token in streamer:
+                accumulated_content += token
+                yield {
+                    "type": "content",
+                    "content": token,
+                    "tool_calls": None
+                }
+            
+            thread.join()
+            
+            tool_call = self._parse_tool_call(accumulated_content) if tools else None
+            
+            if tool_call:
+                yield {
+                    "type": "tool_calls",
+                    "content": None,
+                    "tool_calls": [{
+                        "function": tool_call["function"],
+                        "arguments": tool_call.get("arguments", {})
+                    }]
+                }
+            else:
+                yield {
+                    "type": "final",
+                    "content": accumulated_content,
+                    "tool_calls": None
+                }
+                
+        except Exception as e:
+            logger.error(f"Streaming error: {e}", exc_info=True)
             yield {
-                "type": "content",
-                "content": result["content"],
+                "type": "error",
+                "content": f"Ошибка стриминга: {str(e)}",
                 "tool_calls": None
-            }
-        
-        if result.get("tool_calls"):
-            yield {
-                "type": "tool_calls",
-                "content": result.get("content"),
-                "tool_calls": result["tool_calls"]
             }

@@ -12,7 +12,6 @@ logger = setup_logger(__name__)
 
 class Assistant:
     def __init__(self):
-        self.provider = get_provider()
         self.tool_executor = ToolExecutor()
         self.voice_handler = VoiceHandler()
         self.conversation_history = []
@@ -27,6 +26,10 @@ class Assistant:
         self.conversation_history.append(self.system_prompt)
         logger.info("Assistant initialized")
     
+    def _get_provider(self):
+        from core import get_provider
+        return get_provider()
+    
     def _handle_tool_calls(self, tool_calls):
         results = []
         for tool_call in tool_calls:
@@ -40,6 +43,9 @@ class Assistant:
         return "\n".join(results)
     
     def process_message(self, user_message):
+        from config.settings import get_settings
+        settings = get_settings()
+        
         logger.info(f"Processing message: {user_message}")
         
         self.conversation_history.append({
@@ -55,13 +61,15 @@ class Assistant:
             iteration += 1
             logger.info(f"Processing iteration {iteration}")
             
+            provider = self._get_provider()
+            
             try:
                 if settings.streaming_enabled:
                     response_content = ""
                     tool_calls = None
                     has_content = False
                     
-                    for chunk in self.provider.generate_stream(
+                    for chunk in provider.generate_stream(
                         self.conversation_history, 
                         tools=tools
                     ):
@@ -86,7 +94,7 @@ class Assistant:
                     
                     if not has_content and not tool_calls:
                         logger.warning("Stream completed with no content, falling back to non-streaming")
-                        response = self.provider.generate(
+                        response = provider.generate(
                             self.conversation_history,
                             tools=tools
                         )
@@ -96,7 +104,7 @@ class Assistant:
                             "tool_calls": tool_calls
                         }
                 else:
-                    response = self.provider.generate(
+                    response = provider.generate(
                         self.conversation_history,
                         tools=tools
                     )

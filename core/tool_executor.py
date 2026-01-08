@@ -105,7 +105,9 @@ class ToolExecutor:
                         "max_results": {
                             "type": "integer",
                             "description": "Максимальное количество результатов",
-                            "default": 5
+                            "default": 10,
+                            "minimum": 5,
+                            "maximum": 15
                         }
                     },
                     "required": ["action", "query"]

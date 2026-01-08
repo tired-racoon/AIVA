@@ -16,3 +16,4 @@ winenv/
 *.ipynb
 config.json
 dist/
+bug_report.txt

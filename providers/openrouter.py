@@ -22,6 +22,8 @@ class OpenRouterProvider(BaseLLMProvider):
         messages: List[Dict[str, str]], 
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
+        from config.settings import get_settings
+        settings = get_settings()
         
         logger.info(f"Using model: {settings.openrouter_model}")
 
@@ -54,12 +56,14 @@ class OpenRouterProvider(BaseLLMProvider):
             "content": message.content,
             "tool_calls": None
         }
-    
+
     def generate_stream(
         self, 
         messages: List[Dict[str, str]], 
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> Iterator[Dict[str, Any]]:
+        from config.settings import get_settings
+        settings = get_settings()
         
         logger.info(f"Using model: {settings.openrouter_model}")
 
