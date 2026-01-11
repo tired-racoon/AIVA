@@ -2,6 +2,8 @@ from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLin
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from gui.widgets.chat_display import ChatDisplay
 from utils import setup_logger
+import json
+import re
 
 logger = setup_logger(__name__)
 
@@ -14,6 +16,19 @@ class StreamingThread(QThread):
         super().__init__()
         self.assistant = assistant
         self.message = message
+    
+    def _looks_like_tool_call(self, text: str) -> bool:
+        if not text.strip():
+            return False
+        
+        json_pattern = r'\s*\{\s*["\']function["\']'
+        if re.match(json_pattern, text.strip()):
+            return True
+        
+        if text.strip().startswith('{') and 'function' in text:
+            return True
+        
+        return False
     
     def run(self):
         try:
@@ -35,83 +50,107 @@ class StreamingThread(QThread):
                 settings = get_settings()
                 provider = self.assistant._get_provider()
                 
-                if settings.streaming_enabled:
-                    response_content = ""
-                    tool_calls = None
-                    
-                    for chunk in provider.generate_stream(
-                        self.assistant.conversation_history, 
-                        tools=tools
-                    ):
-                        chunk_type = chunk.get("type", "")
+                try:
+                    if settings.streaming_enabled:
+                        response_content = ""
+                        tool_calls = None
+                        first_chunk_received = False
+                        has_tool_calls = False
                         
-                        if chunk_type == "content" and chunk.get("content"):
-                            response_content += chunk["content"]
-                            self.chunk_received.emit(chunk["content"])
-                        
-                        elif chunk_type == "final" and chunk.get("content"):
-                            response_content = chunk["content"]
-                        
-                        elif chunk_type == "tool_calls" and chunk.get("tool_calls"):
-                            tool_calls = chunk["tool_calls"]
-                            if chunk.get("content"):
-                                response_content = chunk["content"]
-                        
-                        elif chunk_type == "error":
-                            logger.error(f"Stream error: {chunk.get('content')}")
-                            self.error_occurred.emit(chunk.get("content", "Ошибка стриминга"))
+                        try:
+                            for chunk in provider.generate_stream(
+                                self.assistant.conversation_history, 
+                                tools=tools
+                            ):
+                                chunk_type = chunk.get("type", "")
+                                
+                                if chunk_type == "content" and chunk.get("content"):
+                                    content_piece = chunk["content"]
+                                    response_content += content_piece
+                                    
+                                    if not has_tool_calls:
+                                        if not first_chunk_received:
+                                            first_chunk_received = True
+                                        
+                                        self.chunk_received.emit(content_piece)
+                                
+                                elif chunk_type == "final" and chunk.get("content"):
+                                    response_content = chunk["content"]
+                                    if not first_chunk_received and not has_tool_calls:
+                                        self.chunk_received.emit(response_content)
+                                        first_chunk_received = True
+                                
+                                elif chunk_type == "tool_calls" and chunk.get("tool_calls"):
+                                    has_tool_calls = True
+                                    tool_calls = chunk["tool_calls"]
+                                    if chunk.get("content"):
+                                        response_content = chunk["content"]
+                                
+                                elif chunk_type == "error":
+                                    logger.error(f"Stream error: {chunk.get('content')}")
+                                    self.error_occurred.emit(chunk.get("content", "Ошибка стриминга"))
+                                    return
+                        except Exception as stream_iter_error:
+                            logger.error(f"Stream iteration failed: {stream_iter_error}", exc_info=True)
+                            self.error_occurred.emit(f"Ошибка при получении ответа: {str(stream_iter_error)}")
                             return
+                        
+                        response = {
+                            "content": response_content if response_content else None,
+                            "tool_calls": tool_calls
+                        }
+                    else:
+                        response = provider.generate(
+                            self.assistant.conversation_history,
+                            tools=tools
+                        )
+                        if response.get("content"):
+                            self.chunk_received.emit(response["content"])
                     
-                    response = {
-                        "content": response_content if response_content else None,
-                        "tool_calls": tool_calls
-                    }
-                else:
-                    response = provider.generate(
-                        self.assistant.conversation_history,
-                        tools=tools
-                    )
-                    if response.get("content"):
-                        self.chunk_received.emit(response["content"])
-                
-                if response.get("tool_calls"):
-                    logger.info(f"Tool calls detected: {response['tool_calls']}")
-                    
-                    tool_results = self.assistant._handle_tool_calls(response["tool_calls"])
+                    if response.get("tool_calls"):
+                        logger.info(f"Tool calls detected: {response['tool_calls']}")
+                        
+                        tool_results = self.assistant._handle_tool_calls(response["tool_calls"])
+                        
+                        if response.get("content"):
+                            self.assistant.conversation_history.append({
+                                "role": "assistant",
+                                "content": response["content"]
+                            })
+                        
+                        self.assistant.conversation_history.append({
+                            "role": "user",
+                            "content": f"Результаты выполнения инструментов:\n{tool_results}\n\nТеперь дай понятный ответ пользователю на основе этих результатов."
+                        })
+                        
+                        logger.info(f"Tool results: {tool_results}")
+                        continue
                     
                     if response.get("content"):
                         self.assistant.conversation_history.append({
                             "role": "assistant",
                             "content": response["content"]
                         })
-                    
-                    self.assistant.conversation_history.append({
-                        "role": "user",
-                        "content": f"Результаты выполнения инструментов:\n{tool_results}\n\nТеперь дай понятный ответ пользователю на основе этих результатов."
-                    })
-                    
-                    logger.info(f"Tool results: {tool_results}")
-                    continue
+                        self.response_complete.emit()
+                        return
                 
-                if response.get("content"):
-                    self.assistant.conversation_history.append({
-                        "role": "assistant",
-                        "content": response["content"]
-                    })
-                    self.response_complete.emit()
+                except Exception as iter_error:
+                    logger.error(f"Iteration {iteration} error: {iter_error}", exc_info=True)
+                    self.error_occurred.emit(f"Ошибка в итерации {iteration}: {str(iter_error)}")
                     return
             
             self.error_occurred.emit("Не удалось получить ответ после всех итераций")
             
         except Exception as e:
-            logger.error(f"Streaming error: {e}", exc_info=True)
-            self.error_occurred.emit(f"Ошибка: {str(e)}")
+            logger.error(f"Streaming thread error: {e}", exc_info=True)
+            self.error_occurred.emit(f"Критическая ошибка: {str(e)}")
 
 class ChatTab(QWidget):
     def __init__(self, assistant, parent=None):
         super().__init__(parent)
         self.assistant = assistant
         self.streaming_thread = None
+        self.response_thread = None
         self.current_bubble = None
         self.dark_mode = True
         self.setup_ui()
@@ -273,8 +312,10 @@ class ChatTab(QWidget):
         
         from config.settings import settings
         
+        self.chat_display.add_loading_message()
+        
         if settings.streaming_enabled:
-            self.current_bubble = self.chat_display.add_streaming_message()
+            self.current_bubble = None
             
             self.streaming_thread = StreamingThread(self.assistant, message)
             self.streaming_thread.chunk_received.connect(self.on_chunk_received)
@@ -282,8 +323,6 @@ class ChatTab(QWidget):
             self.streaming_thread.error_occurred.connect(self.on_error)
             self.streaming_thread.start()
         else:
-            self.chat_display.add_loading_message()
-            
             from PyQt5.QtCore import QThread, pyqtSignal
             
             class ResponseThread(QThread):
@@ -313,13 +352,18 @@ class ChatTab(QWidget):
                 self.send_button.setEnabled(True)
                 self.chat_input.setFocus()
             
-            response_thread = ResponseThread(self.assistant, message)
-            response_thread.response_ready.connect(on_response_ready)
-            response_thread.start()
-    
+            self.response_thread = ResponseThread(self.assistant, message)
+            self.response_thread.response_ready.connect(on_response_ready)
+            self.response_thread.start()
+
     def on_chunk_received(self, chunk):
-        if self.current_bubble:
-            self.current_bubble.append_text(chunk)
+        if self.current_bubble is None:
+            self.chat_display.remove_loading_message()
+            self.current_bubble = self.chat_display.add_streaming_message()
+        
+        self.current_bubble.append_text(chunk)
+    
+
     
     def on_response_complete(self):
         self.current_bubble = None
@@ -342,7 +386,8 @@ class ChatTab(QWidget):
         self.chat_display.clear()
     
     def reset_conversation(self):
-        self.assistant.conversation_history = [self.assistant.system_prompt]
+        self.assistant.conversation_history = []
+        self.assistant._update_system_prompt()
         self.chat_display.add_message("Conversation reset", is_user=False)
     
     def toggle_theme(self):
@@ -362,3 +407,5 @@ class ChatTab(QWidget):
     def cleanup(self):
         if self.streaming_thread and self.streaming_thread.isRunning():
             self.streaming_thread.wait(1000)
+        if self.response_thread and self.response_thread.isRunning():
+            self.response_thread.wait(1000)

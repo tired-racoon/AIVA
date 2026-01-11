@@ -82,29 +82,65 @@ class YandexProvider(BaseLLMProvider):
             stream = self.client.chat.completions.create(**kwargs)
             
             accumulated_content = ""
-            tool_calls_data = []
+            tool_calls_accumulator = {}
             
-            for chunk in stream:
-                if not chunk.choices or len(chunk.choices) == 0:
-                    continue
-                
-                delta = chunk.choices[0].delta
-                
-                if hasattr(delta, 'content') and delta.content:
-                    accumulated_content += delta.content
-                    yield {
-                        "type": "content",
-                        "content": delta.content,
-                        "tool_calls": None
-                    }
-                
-                if hasattr(delta, 'tool_calls') and delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        if tc.function:
-                            tool_calls_data.append({
-                                "function": tc.function.name,
-                                "arguments": json.loads(tc.function.arguments)
-                            })
+            try:
+                for chunk in stream:
+                    if not chunk.choices or len(chunk.choices) == 0:
+                        continue
+                    
+                    delta = chunk.choices[0].delta
+                    
+                    if hasattr(delta, 'content') and delta.content:
+                        accumulated_content += delta.content
+                        yield {
+                            "type": "content",
+                            "content": delta.content,
+                            "tool_calls": None
+                        }
+                    
+                    if hasattr(delta, 'tool_calls') and delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            index = tc.index if hasattr(tc, 'index') else 0
+                            
+                            if index not in tool_calls_accumulator:
+                                tool_calls_accumulator[index] = {
+                                    "function_name": "",
+                                    "arguments": ""
+                                }
+                            
+                            if tc.function:
+                                if tc.function.name:
+                                    tool_calls_accumulator[index]["function_name"] = tc.function.name
+                                if tc.function.arguments:
+                                    tool_calls_accumulator[index]["arguments"] += tc.function.arguments
+            except Exception as stream_error:
+                logger.error(f"Stream iteration error: {stream_error}", exc_info=True)
+                yield {
+                    "type": "error",
+                    "content": f"Ошибка при получении данных: {str(stream_error)}",
+                    "tool_calls": None
+                }
+                return
+            
+            tool_calls_data = []
+            if tool_calls_accumulator:
+                for idx in sorted(tool_calls_accumulator.keys()):
+                    tc = tool_calls_accumulator[idx]
+                    try:
+                        args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                        tool_calls_data.append({
+                            "function": tc["function_name"],
+                            "arguments": args
+                        })
+                    except json.JSONDecodeError as je:
+                        logger.error(f"Failed to parse tool call arguments: {tc['arguments']}, error: {je}")
+                        yield {
+                            "type": "error",
+                            "content": f"Ошибка парсинга аргументов инструмента: {str(je)}",
+                            "tool_calls": None
+                        }
+                        return
             
             if accumulated_content and not tool_calls_data:
                 yield {

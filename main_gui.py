@@ -15,16 +15,92 @@ class Assistant:
         self.tool_executor = ToolExecutor()
         self.voice_handler = VoiceHandler()
         self.conversation_history = []
-        self.system_prompt = {
+        
+        self.base_system_prompt = """Ты - голосовой помощник Айва. Говори на русском языке.
+    Отвечай коротко и по существу. Используй доступные инструменты для выполнения задач пользователя.
+
+    КОГДА ИСПОЛЬЗОВАТЬ ИНСТРУМЕНТЫ:
+
+    web_search - используй когда:
+    - Пользователь явно просит найти информацию ("найди", "поищи", "что такое", "кто такой")
+    - Тебе нужна актуальная информация (новости, погода, курсы валют)
+    - Ты не уверен в ответе или у тебя нет информации по теме
+    - Пользователь спрашивает о событиях после января 2025 года
+    Примеры: "найди информацию о Python", "какая погода в Москве", "что случилось сегодня"
+
+    music - используй когда:
+    - Пользователь просит включить/воспроизвести музыку, трек, песню, исполнителя, альбом
+    - Пользователь называет название трека или имя исполнителя
+    - Пользователь просит найти музыку
+    - Пользователь просит включить любимые треки
+    - Пользователь просит выключить/остановить музыку
+    Примеры: "включи Call Me Karizma", "поставь Linkin Park", "включи любимое", "выключи музыку"
+
+    os_control - используй когда:
+    - Пользователь просит изменить громкость звука
+    - Пользователь просит включить/выключить звук (мут)
+    - Пользователь просит изменить яркость экрана
+    Примеры: "сделай громче", "установи громкость на 50%", "выключи звук", "увеличь яркость"
+
+    ОБЩИЕ ПРАВИЛА:
+    - При необходимости используй информацию о текущем времени и местоположении пользователя из USER_INFO
+    - Не используй web search для поиска текущего времени
+    - Если не знаешь ответ - используй web_search
+    - Если пользователь упоминает музыку или исполнителя - используй music
+    - Отвечай обычным текстом только на простые вопросы, где инструменты не нужны"""
+        
+        system_message = {
             "role": "system",
-            "content": """Ты - голосовой помощник Айва. Говори на русском языке.
-Отвечай коротко и по существу. Используй доступные инструменты для выполнения задач пользователя.
-Если пользователь просит найти информацию - используй web_search.
-Если пользователь просит включить музыку или найти трек - используй music.
-Если пользователь просит изменить громкость или яркость - используй os_control."""
+            "content": self.base_system_prompt
         }
-        self.conversation_history.append(self.system_prompt)
+        self.conversation_history.append(system_message)
+        
         logger.info("Assistant initialized")
+
+    def _get_location_info(self) -> str:
+        try:
+            import requests
+            response = requests.get('https://ipapi.co/json/', timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                city = data.get('city', 'неизвестно')
+                country = data.get('country_name', 'неизвестно')
+                return f"Текущее местоположение пользователя: {city}, {country}"
+        except:
+            pass
+        return "Местоположение пользователя: неизвестно"
+
+    def _get_time_info(self) -> str:
+        from datetime import datetime
+        import locale
+        try:
+            locale.setlocale(locale.LC_TIME, 'ru_RU.UTF-8')
+        except:
+            pass
+        now = datetime.now()
+        date_str = now.strftime("%d.%m.%Y")
+        time_str = now.strftime("%H:%M")
+        weekday = now.strftime("%A")
+        return f"Текущая дата и время: {date_str}, {time_str} ({weekday})"
+
+    def _update_system_prompt(self):
+        location_info = self._get_location_info()
+        time_info = self._get_time_info()
+        
+        full_prompt = f"{location_info}\n{time_info}\n\n{self.base_system_prompt}"
+        
+        system_message = {
+            "role": "system",
+            "content": full_prompt
+        }
+        
+        if self.conversation_history and self.conversation_history[0].get("role") == "system":
+            self.conversation_history[0] = system_message
+        else:
+            if self.conversation_history:
+                self.conversation_history[0:0] = [system_message]
+            else:
+                self.conversation_history.append(system_message)
     
     def _get_provider(self):
         from core import get_provider
@@ -48,9 +124,14 @@ class Assistant:
         
         logger.info(f"Processing message: {user_message}")
         
+        location_info = self._get_location_info()
+        time_info = self._get_time_info()
+        
+        user_info = f"<USER_INFO>\n{location_info}\n{time_info}\n</USER_INFO>\n\n"
+        
         self.conversation_history.append({
             "role": "user",
-            "content": user_message
+            "content": user_info + user_message
         })
         
         tools = self.tool_executor.get_tools_definition()
@@ -69,28 +150,33 @@ class Assistant:
                     tool_calls = None
                     has_content = False
                     
-                    for chunk in provider.generate_stream(
-                        self.conversation_history, 
-                        tools=tools
-                    ):
-                        chunk_type = chunk.get("type", "")
-                        
-                        if chunk_type == "content" and chunk.get("content"):
-                            response_content += chunk["content"]
-                            has_content = True
-                        
-                        elif chunk_type == "final" and chunk.get("content"):
-                            response_content = chunk["content"]
-                            has_content = True
-                        
-                        elif chunk_type == "tool_calls" and chunk.get("tool_calls"):
-                            tool_calls = chunk["tool_calls"]
-                            if chunk.get("content"):
+                    try:
+                        for chunk in provider.generate_stream(
+                            self.conversation_history, 
+                            tools=tools
+                        ):
+                            chunk_type = chunk.get("type", "")
+                            
+                            if chunk_type == "content" and chunk.get("content"):
+                                content_piece = chunk["content"]
+                                response_content += content_piece
+                                has_content = True
+                            
+                            elif chunk_type == "final" and chunk.get("content"):
                                 response_content = chunk["content"]
-                        
-                        elif chunk_type == "error":
-                            logger.error(f"Stream error: {chunk.get('content')}")
-                            return chunk.get("content", "Ошибка стриминга")
+                                has_content = True
+                            
+                            elif chunk_type == "tool_calls" and chunk.get("tool_calls"):
+                                tool_calls = chunk["tool_calls"]
+                                if chunk.get("content"):
+                                    response_content = chunk["content"]
+                            
+                            elif chunk_type == "error":
+                                logger.error(f"Stream error: {chunk.get('content')}")
+                                return chunk.get("content", "Ошибка стриминга")
+                    except Exception as stream_iter_error:
+                        logger.error(f"Stream iteration failed: {stream_iter_error}", exc_info=True)
+                        return f"Ошибка при получении ответа: {str(stream_iter_error)}"
                     
                     if not has_content and not tool_calls:
                         logger.warning("Stream completed with no content, falling back to non-streaming")
@@ -170,7 +256,7 @@ class Assistant:
         
         logger.error("Failed to get response after all iterations")
         return "Не удалось получить ответ. Попробуйте еще раз."
-    
+        
     def cleanup(self):
         self.voice_handler.cleanup()
 
