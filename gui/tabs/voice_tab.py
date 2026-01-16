@@ -4,6 +4,7 @@ from PyQt5.QtCore import QThread, pyqtSignal, Qt
 from PyQt5.QtGui import QFont, QTextCursor
 from config.settings import settings
 from utils import setup_logger
+import threading
 
 logger = setup_logger(__name__)
 
@@ -18,12 +19,33 @@ class VoiceThread(QThread):
         self.running = False
         self.voice_input_enabled = True
         self.voice_output_enabled = True
+        self.processing = False
     
     def set_voice_input(self, enabled):
         self.voice_input_enabled = enabled
     
     def set_voice_output(self, enabled):
         self.voice_output_enabled = enabled
+    
+    def stop(self):
+        self.running = False
+        if self.processing:
+            self.assistant.voice_handler.stop_playback_flag = True
+            if hasattr(self.assistant.voice_handler, 'playback_process') and self.assistant.voice_handler.playback_process:
+                try:
+                    self.assistant.voice_handler.playback_process.terminate()
+                    self.assistant.voice_handler.playback_process.wait(timeout=0.5)
+                except:
+                    pass
+            
+            import platform
+            if platform.system() == "Windows":
+                try:
+                    if hasattr(self.assistant.voice_handler, 'pygame_initialized') and self.assistant.voice_handler.pygame_initialized:
+                        import pygame
+                        pygame.mixer.music.stop()
+                except:
+                    pass
     
     def run(self):
         self.running = True
@@ -33,48 +55,72 @@ class VoiceThread(QThread):
             while self.running:
                 try:
                     if self.voice_input_enabled and self.assistant.voice_handler.listen_for_activation():
+                        if not self.running:
+                            break
+                        
+                        self.processing = True
                         self.status_changed.emit("Activated! Listening...")
-                        self.assistant.conversation_history = [self.assistant.system_prompt]
+                        self.assistant.conversation_history = []
+                        self.assistant._update_system_prompt()
                         
                         audio_path = self.assistant.voice_handler.record_command()
                         
+                        if not self.running:
+                            self.processing = False
+                            break
+                        
                         if not audio_path:
-                            self.status_changed.emit("Recording failed. Listening for activation...")
+                            self.status_changed.emit("No speech detected. Listening for activation...")
+                            self.processing = False
                             continue
                         
                         user_text = self.assistant.voice_handler.transcribe(audio_path)
                         
+                        if not self.running:
+                            self.processing = False
+                            break
+                        
                         if user_text and len(user_text.strip()) > 2:
-                            self.message_received.emit(user_text)
                             self.status_changed.emit("Processing...")
                             
                             response = self.assistant.process_message(user_text)
-                            self.response_received.emit(response)
+                            
+                            if not self.running:
+                                self.processing = False
+                                break
                             
                             if self.voice_output_enabled:
                                 self.status_changed.emit("Speaking...")
                                 self.assistant.voice_handler.speak(response)
                         
+                        self.processing = False
+                        
+                        if not self.running:
+                            break
+                        
                         self.status_changed.emit("Listening for activation...")
                         
                 except Exception as e:
+                    self.processing = False
                     logger.error(f"Error in voice loop: {e}", exc_info=True)
                     self.status_changed.emit(f"Error: {str(e)}")
                     import time
                     time.sleep(1)
         
+        except KeyboardInterrupt:
+            logger.info("Voice thread stopped by interrupt")
         except Exception as e:
             logger.error(f"Voice thread error: {e}", exc_info=True)
             self.status_changed.emit(f"Critical error: {str(e)}")
-    
-    def stop(self):
-        self.running = False
+        finally:
+            self.processing = False
 
 class VoiceTab(QWidget):
     def __init__(self, assistant, parent=None):
         super().__init__(parent)
         self.assistant = assistant
         self.voice_thread = None
+        self.is_active = False
         self.setup_ui()
     
     def setup_ui(self):
@@ -106,28 +152,58 @@ class VoiceTab(QWidget):
         
         layout.addWidget(voice_options_group)
         
-        self.voice_display = QTextEdit()
-        self.voice_display.setReadOnly(True)
-        font = QFont("Consolas", 10)
-        self.voice_display.setFont(font)
-        layout.addWidget(self.voice_display)
+        layout.addStretch()
         
-        control_layout = QHBoxLayout()
+        control_layout = QVBoxLayout()
+        control_layout.setAlignment(Qt.AlignCenter)
         
-        self.start_voice_button = QPushButton("Start Voice Assistant")
-        self.start_voice_button.clicked.connect(self.start_voice_assistant)
-        control_layout.addWidget(self.start_voice_button)
-        
-        self.stop_voice_button = QPushButton("Stop Voice Assistant")
-        self.stop_voice_button.clicked.connect(self.stop_voice_assistant)
-        self.stop_voice_button.setEnabled(False)
-        control_layout.addWidget(self.stop_voice_button)
+        self.toggle_voice_button = QPushButton()
+        self.toggle_voice_button.setFixedSize(150, 150)
+        self.toggle_voice_button.clicked.connect(self.toggle_voice_assistant)
+        self.update_button_style(False)
+        control_layout.addWidget(self.toggle_voice_button, alignment=Qt.AlignCenter)
         
         layout.addLayout(control_layout)
         
         info_label = QLabel(f"Activation phrase: '{settings.activation_phrase}'")
         info_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(info_label)
+    
+    def update_button_style(self, active):
+        if active:
+            self.toggle_voice_button.setStyleSheet("""
+                QPushButton {
+                    background-color: #ff4444;
+                    border: none;
+                    border-radius: 75px;
+                    font-size: 48pt;
+                    color: white;
+                }
+                QPushButton:hover {
+                    background-color: #ff6666;
+                }
+                QPushButton:pressed {
+                    background-color: #cc0000;
+                }
+            """)
+            self.toggle_voice_button.setText("⏹")
+        else:
+            self.toggle_voice_button.setStyleSheet("""
+                QPushButton {
+                    background-color: #4CAF50;
+                    border: none;
+                    border-radius: 75px;
+                    font-size: 48pt;
+                    color: white;
+                }
+                QPushButton:hover {
+                    background-color: #5cbf60;
+                }
+                QPushButton:pressed {
+                    background-color: #3d8b40;
+                }
+            """)
+            self.toggle_voice_button.setText("▶")
     
     def on_voice_input_changed(self, state):
         if self.voice_thread:
@@ -137,18 +213,22 @@ class VoiceTab(QWidget):
         if self.voice_thread:
             self.voice_thread.set_voice_output(state == Qt.Checked)
     
+    def toggle_voice_assistant(self):
+        if not self.is_active:
+            self.start_voice_assistant()
+        else:
+            self.stop_voice_assistant()
+    
     def start_voice_assistant(self):
         if self.voice_thread is None or not self.voice_thread.isRunning():
             self.voice_thread = VoiceThread(self.assistant)
             self.voice_thread.set_voice_input(self.voice_input_check.isChecked())
             self.voice_thread.set_voice_output(self.voice_output_check.isChecked())
-            self.voice_thread.message_received.connect(self.on_voice_message)
-            self.voice_thread.response_received.connect(self.on_voice_response)
             self.voice_thread.status_changed.connect(self.on_voice_status)
             self.voice_thread.start()
             
-            self.start_voice_button.setEnabled(False)
-            self.stop_voice_button.setEnabled(True)
+            self.is_active = True
+            self.update_button_style(True)
             self.voice_status_label.setText("Active")
             self.voice_status_label.setStyleSheet("color: green;")
     
@@ -157,28 +237,14 @@ class VoiceTab(QWidget):
             self.voice_thread.stop()
             self.voice_thread.wait()
             
-            self.start_voice_button.setEnabled(True)
-            self.stop_voice_button.setEnabled(False)
+            self.is_active = False
+            self.update_button_style(False)
             self.voice_status_label.setText("Inactive")
             self.voice_status_label.setStyleSheet("color: red;")
-    
-    def on_voice_message(self, message):
-        cursor = self.voice_display.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertHtml(f'<p style="color: #0066cc;"><b>User:</b> {message}</p>')
-        self.voice_display.setTextCursor(cursor)
-        self.voice_display.ensureCursorVisible()
-    
-    def on_voice_response(self, response):
-        cursor = self.voice_display.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertHtml(f'<p style="color: #009900;"><b>Assistant:</b> {response}</p>')
-        self.voice_display.setTextCursor(cursor)
-        self.voice_display.ensureCursorVisible()
-    
+
     def on_voice_status(self, status):
         self.voice_status_label.setText(status)
-    
+
     def cleanup(self):
         if self.voice_thread and self.voice_thread.isRunning():
             self.voice_thread.stop()

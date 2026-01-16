@@ -22,8 +22,11 @@ class Settings(BaseModel):
     
     yandex_music_token: str = ""
     
+    tts_provider: Literal["vosk", "xtts"] = "xtts"
     tts_speaker_id: int = 2
     tts_model_name: str = "vosk-model-tts-ru-0.9-multi"
+    tts_xtts_speaker: str = "Claribel Dervla"
+    tts_xtts_language: str = "ru"
     
     activation_phrase: str = "айва"
     silence_threshold: int = 500

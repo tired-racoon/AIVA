@@ -54,8 +54,7 @@ class StreamingThread(QThread):
                     if settings.streaming_enabled:
                         response_content = ""
                         tool_calls = None
-                        first_chunk_received = False
-                        has_tool_calls = False
+                        has_content = False
                         
                         try:
                             for chunk in provider.generate_stream(
@@ -67,23 +66,18 @@ class StreamingThread(QThread):
                                 if chunk_type == "content" and chunk.get("content"):
                                     content_piece = chunk["content"]
                                     response_content += content_piece
-                                    
-                                    if not has_tool_calls:
-                                        if not first_chunk_received:
-                                            first_chunk_received = True
-                                        
-                                        self.chunk_received.emit(content_piece)
+                                    has_content = True
+                                    self.chunk_received.emit(content_piece)
                                 
                                 elif chunk_type == "final" and chunk.get("content"):
-                                    response_content = chunk["content"]
-                                    if not first_chunk_received and not has_tool_calls:
+                                    if not has_content:
+                                        response_content = chunk["content"]
+                                        has_content = True
                                         self.chunk_received.emit(response_content)
-                                        first_chunk_received = True
                                 
                                 elif chunk_type == "tool_calls" and chunk.get("tool_calls"):
-                                    has_tool_calls = True
                                     tool_calls = chunk["tool_calls"]
-                                    if chunk.get("content"):
+                                    if chunk.get("content") and not has_content:
                                         response_content = chunk["content"]
                                 
                                 elif chunk_type == "error":
@@ -95,17 +89,24 @@ class StreamingThread(QThread):
                             self.error_occurred.emit(f"Ошибка при получении ответа: {str(stream_iter_error)}")
                             return
                         
-                        response = {
-                            "content": response_content if response_content else None,
-                            "tool_calls": tool_calls
-                        }
+                        if not has_content and not tool_calls:
+                            logger.warning("Stream completed with no content, falling back to non-streaming")
+                            response = provider.generate(
+                                self.assistant.conversation_history,
+                                tools=tools
+                            )
+                        else:
+                            response = {
+                                "content": response_content if response_content else None,
+                                "tool_calls": tool_calls
+                            }
                     else:
                         response = provider.generate(
                             self.assistant.conversation_history,
                             tools=tools
                         )
-                        if response.get("content"):
-                            self.chunk_received.emit(response["content"])
+                    
+                    logger.info(f"Response: content={bool(response.get('content'))}, tool_calls={bool(response.get('tool_calls'))}")
                     
                     if response.get("tool_calls"):
                         logger.info(f"Tool calls detected: {response['tool_calls']}")
@@ -127,13 +128,40 @@ class StreamingThread(QThread):
                         continue
                     
                     if response.get("content"):
+                        content = response["content"].strip()
+                        
+                        if content.startswith('{') and content.endswith('}'):
+                            logger.warning("Response looks like JSON, not natural text")
+                            try:
+                                import json
+                                parsed = json.loads(content)
+                                if "function" in parsed:
+                                    logger.info("Detected tool call in content, executing...")
+                                    tool_results = self.assistant._handle_tool_calls([parsed])
+                                    
+                                    self.assistant.conversation_history.append({
+                                        "role": "assistant",
+                                        "content": content
+                                    })
+                                    
+                                    self.assistant.conversation_history.append({
+                                        "role": "user",
+                                        "content": f"Результаты: {tool_results}\n\nДай понятный ответ."
+                                    })
+                                    continue
+                            except:
+                                pass
+                        
                         self.assistant.conversation_history.append({
                             "role": "assistant",
-                            "content": response["content"]
+                            "content": content
                         })
+                        logger.info(f"Returning response: {content[:100]}...")
                         self.response_complete.emit()
                         return
-                
+                    
+                    logger.warning("No content in response")
+                    
                 except Exception as iter_error:
                     logger.error(f"Iteration {iteration} error: {iter_error}", exc_info=True)
                     self.error_occurred.emit(f"Ошибка в итерации {iteration}: {str(iter_error)}")

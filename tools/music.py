@@ -22,7 +22,71 @@ class YandexMusicProvider(BaseMusicProvider):
         self.stop_playback_flag = False
         self.playback_process = None
         self.pygame_initialized = False
+        self.paused = False
+        self.pause_position = 0
         logger.info("Yandex Music provider initialized")
+    
+    def is_playing(self) -> bool:
+        if self.paused:
+            return False
+        
+        import platform
+        system = platform.system()
+        
+        if system == "Windows":
+            try:
+                if hasattr(self, 'pygame_initialized') and self.pygame_initialized:
+                    import pygame
+                    return pygame.mixer.music.get_busy()
+            except:
+                pass
+        
+        if self.playback_process and self.playback_process.poll() is None:
+            return True
+        
+        return False
+    
+    def pause_music(self) -> str:
+        if self.paused:
+            return "Музыка уже на паузе"
+        
+        import platform
+        system = platform.system()
+        
+        if system == "Windows":
+            try:
+                if hasattr(self, 'pygame_initialized') and self.pygame_initialized:
+                    import pygame
+                    if pygame.mixer.music.get_busy():
+                        self.pause_position = pygame.mixer.music.get_pos()
+                        pygame.mixer.music.pause()
+                        self.paused = True
+                        logger.info(f"Music paused at position: {self.pause_position}")
+                        return "Музыка поставлена на паузу"
+            except Exception as e:
+                logger.error(f"Failed to pause music: {e}")
+        
+        return "Пауза не поддерживается на этой системе"
+    
+    def resume_music(self) -> str:
+        if not self.paused:
+            return "Музыка не на паузе"
+        
+        import platform
+        system = platform.system()
+        
+        if system == "Windows":
+            try:
+                if hasattr(self, 'pygame_initialized') and self.pygame_initialized:
+                    import pygame
+                    pygame.mixer.music.unpause()
+                    self.paused = False
+                    logger.info("Music resumed")
+                    return "Воспроизведение продолжено"
+            except Exception as e:
+                logger.error(f"Failed to resume music: {e}")
+        
+        return "Продолжение не поддерживается на этой системе"
     
     def _download_track(self, track_id: str, timeout: int = 300) -> Optional[str]:
         track_path = os.path.join(self.temp_dir, f"{track_id}.mp3")
@@ -433,6 +497,12 @@ class MusicTool(BaseTool):
             
             elif action == "stop_music":
                 return self.provider.stop_music()
+            
+            elif action == "pause_music":
+                return self.provider.pause_music()
+            
+            elif action == "resume_music":
+                return self.provider.resume_music()
             
             elif action == "get_track_info":
                 track_id = params.get("track_id")

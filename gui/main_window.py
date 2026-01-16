@@ -102,6 +102,7 @@ class MainWindow(QMainWindow):
                 }
                 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
                     border: 1px solid #0d7377;
+                    outline: none;
                 }
                 QPushButton {
                     background-color: #3d3d3d;
@@ -109,12 +110,17 @@ class MainWindow(QMainWindow):
                     border: 1px solid #555555;
                     border-radius: 3px;
                     padding: 5px 15px;
+                    outline: none;
                 }
                 QPushButton:hover {
                     background-color: #4d4d4d;
                 }
                 QPushButton:pressed {
                     background-color: #2d2d2d;
+                }
+                QPushButton:focus {
+                    outline: none;
+                    border: 1px solid #555555;
                 }
                 QTextEdit {
                     background-color: #2d2d2d;
@@ -123,6 +129,10 @@ class MainWindow(QMainWindow):
                 }
                 QCheckBox {
                     color: #ffffff;
+                    outline: none;
+                }
+                QCheckBox:focus {
+                    outline: none;
                 }
                 QScrollArea {
                     background-color: #1e1e1e;
@@ -138,6 +148,9 @@ class MainWindow(QMainWindow):
                 }
                 QScrollBar::handle:vertical:hover {
                     background-color: #666666;
+                }
+                * {
+                    outline: none;
                 }
             """
             self.setStyleSheet(app_style)
@@ -188,6 +201,7 @@ class MainWindow(QMainWindow):
                 }
                 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
                     border: 1px solid #25D366;
+                    outline: none;
                 }
                 QPushButton {
                     background-color: #e0e0e0;
@@ -195,12 +209,17 @@ class MainWindow(QMainWindow):
                     border: 1px solid #cccccc;
                     border-radius: 3px;
                     padding: 5px 15px;
+                    outline: none;
                 }
                 QPushButton:hover {
                     background-color: #d0d0d0;
                 }
                 QPushButton:pressed {
                     background-color: #c0c0c0;
+                }
+                QPushButton:focus {
+                    outline: none;
+                    border: 1px solid #cccccc;
                 }
                 QTextEdit {
                     background-color: #ffffff;
@@ -209,6 +228,10 @@ class MainWindow(QMainWindow):
                 }
                 QCheckBox {
                     color: #000000;
+                    outline: none;
+                }
+                QCheckBox:focus {
+                    outline: none;
                 }
                 QScrollArea {
                     background-color: #f0f0f0;
@@ -224,6 +247,9 @@ class MainWindow(QMainWindow):
                 }
                 QScrollBar::handle:vertical:hover {
                     background-color: #bbbbbb;
+                }
+                * {
+                    outline: none;
                 }
             """
             self.setStyleSheet(app_style)
