@@ -1,10 +1,11 @@
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QTextEdit, QLabel, QGroupBox, QCheckBox)
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QTextCursor
 from config.settings import settings
 from utils import setup_logger
 import threading
+import time
 
 logger = setup_logger(__name__)
 
@@ -20,6 +21,7 @@ class VoiceThread(QThread):
         self.voice_input_enabled = True
         self.voice_output_enabled = True
         self.processing = False
+        self._stop_requested = False
     
     def set_voice_input(self, enabled):
         self.voice_input_enabled = enabled
@@ -28,74 +30,115 @@ class VoiceThread(QThread):
         self.voice_output_enabled = enabled
     
     def stop(self):
+        logger.info("Voice thread stop requested")
+        self._stop_requested = True
         self.running = False
-        if self.processing:
-            self.assistant.voice_handler.stop_playback_flag = True
-            if hasattr(self.assistant.voice_handler, 'playback_process') and self.assistant.voice_handler.playback_process:
-                try:
-                    self.assistant.voice_handler.playback_process.terminate()
-                    self.assistant.voice_handler.playback_process.wait(timeout=0.5)
-                except:
-                    pass
-            
-            import platform
-            if platform.system() == "Windows":
-                try:
-                    if hasattr(self.assistant.voice_handler, 'pygame_initialized') and self.assistant.voice_handler.pygame_initialized:
-                        import pygame
-                        pygame.mixer.music.stop()
-                except:
-                    pass
+        
+        self.assistant.voice_handler.stop_listening_flag = True
+        self.assistant.voice_handler.stop_playback_flag = True
+        
+        if hasattr(self.assistant.voice_handler, 'playback_process') and self.assistant.voice_handler.playback_process:
+            try:
+                self.assistant.voice_handler.playback_process.terminate()
+                self.assistant.voice_handler.playback_process.wait(timeout=0.5)
+            except:
+                pass
+            self.assistant.voice_handler.playback_process = None
+        
+        import platform
+        if platform.system() == "Windows":
+            try:
+                if hasattr(self.assistant.voice_handler, 'pygame_initialized') and self.assistant.voice_handler.pygame_initialized:
+                    import pygame
+                    pygame.mixer.music.stop()
+            except:
+                pass
+        
+        logger.info("Voice thread stopped")
     
     def run(self):
         self.running = True
+        self._stop_requested = False
+        self.assistant.voice_handler.stop_listening_flag = False
+        self.assistant.voice_handler.stop_playback_flag = False
+        
+        self.assistant.set_voice_mode(True)
+        
         self.status_changed.emit("Listening for activation...")
         
         try:
-            while self.running:
+            while self.running and not self._stop_requested:
                 try:
                     if self.voice_input_enabled and self.assistant.voice_handler.listen_for_activation():
-                        if not self.running:
+                        if not self.running or self._stop_requested:
                             break
                         
                         self.processing = True
-                        self.status_changed.emit("Activated! Listening...")
+                        self.status_changed.emit("Processing...")
+                        
+                        music_was_playing = self.assistant.tool_executor.tools["music"].provider.is_playing()
+                        if music_was_playing:
+                            self.assistant.tool_executor.tools["music"].provider.pause_music()
+                        
                         self.assistant.conversation_history = []
                         self.assistant._update_system_prompt()
                         
-                        audio_path = self.assistant.voice_handler.record_command()
+                        user_text = self.assistant.voice_handler.last_transcribed_text
                         
-                        if not self.running:
+                        if not self.running or self._stop_requested:
                             self.processing = False
                             break
                         
-                        if not audio_path:
-                            self.status_changed.emit("No speech detected. Listening for activation...")
-                            self.processing = False
-                            continue
+                        response = self.assistant.process_message(user_text)
                         
-                        user_text = self.assistant.voice_handler.transcribe(audio_path)
-                        
-                        if not self.running:
+                        if not self.running or self._stop_requested:
                             self.processing = False
                             break
                         
-                        if user_text and len(user_text.strip()) > 2:
-                            self.status_changed.emit("Processing...")
-                            
-                            response = self.assistant.process_message(user_text)
-                            
-                            if not self.running:
-                                self.processing = False
-                                break
-                            
-                            if self.voice_output_enabled:
-                                self.status_changed.emit("Speaking...")
-                                self.assistant.voice_handler.speak(response)
+                        if self.voice_output_enabled and response and response.strip():
+                            self.status_changed.emit("Speaking...")
+                            self.assistant.voice_handler.speak(response)
+                        
+                        if not self.running or self._stop_requested:
+                            self.processing = False
+                            break
+                        
+                        self.status_changed.emit("Waiting for continuation...")
+                        wait_start = time.time()
+                        conversation_continues = False
+                        
+                        while time.time() - wait_start < 3.0 and not self._stop_requested:
+                            if self.assistant.voice_handler.check_for_speech(timeout=0.5):
+                                logger.info("User continues conversation")
+                                conversation_continues = True
+                                
+                                if self.assistant.voice_handler.listen_for_activation():
+                                    user_text = self.assistant.voice_handler.last_transcribed_text
+                                    logger.info(f"User continues: {user_text}")
+                                    self.status_changed.emit("Processing...")
+                                    response = self.assistant.process_message(user_text)
+                                    
+                                    if not self.running or self._stop_requested:
+                                        break
+                                    
+                                    if self.voice_output_enabled and response and response.strip():
+                                        self.status_changed.emit("Speaking...")
+                                        self.assistant.voice_handler.speak(response)
+                                    
+                                    wait_start = time.time()
+                            time.sleep(0.1)
+                        
+                        if not conversation_continues or self._stop_requested:
+                            logger.info("Conversation ended, resetting history")
+                            self.assistant.conversation_history = []
+                            self.assistant._update_system_prompt()
                         
                         self.processing = False
                         
-                        if not self.running:
+                        if music_was_playing:
+                            self.assistant.tool_executor.tools["music"].provider.resume_music()
+                        
+                        if not self.running or self._stop_requested:
                             break
                         
                         self.status_changed.emit("Listening for activation...")
@@ -104,7 +147,6 @@ class VoiceThread(QThread):
                     self.processing = False
                     logger.error(f"Error in voice loop: {e}", exc_info=True)
                     self.status_changed.emit(f"Error: {str(e)}")
-                    import time
                     time.sleep(1)
         
         except KeyboardInterrupt:
@@ -114,6 +156,9 @@ class VoiceThread(QThread):
             self.status_changed.emit(f"Critical error: {str(e)}")
         finally:
             self.processing = False
+            self.assistant.set_voice_mode(False)
+            self.assistant.voice_handler.stop_listening_flag = False
+            self.assistant.voice_handler.stop_playback_flag = False
 
 class VoiceTab(QWidget):
     def __init__(self, assistant, parent=None):
@@ -235,7 +280,7 @@ class VoiceTab(QWidget):
     def stop_voice_assistant(self):
         if self.voice_thread and self.voice_thread.isRunning():
             self.voice_thread.stop()
-            self.voice_thread.wait()
+            self.voice_thread.wait(2000)
             
             self.is_active = False
             self.update_button_style(False)
@@ -248,4 +293,4 @@ class VoiceTab(QWidget):
     def cleanup(self):
         if self.voice_thread and self.voice_thread.isRunning():
             self.voice_thread.stop()
-            self.voice_thread.wait()
+            self.voice_thread.wait(2000)

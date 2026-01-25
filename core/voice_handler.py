@@ -45,14 +45,19 @@ class VoiceHandler:
         self.tts_provider = settings.tts_provider
         self._init_tts()
         
-        self.buffer_size = int(settings.buffer_duration * self.rate / self.chunk)
-        self.audio_buffer = deque(maxlen=self.buffer_size)
+        self.activation_buffer_size = int(1.0 * self.rate / self.chunk)
+        self.activation_buffer = deque(maxlen=self.activation_buffer_size)
         
         self.silence_chunks = int(settings.silence_duration * self.rate / self.chunk)
         
         self.playback_audio = None
         self.stop_playback_flag = False
         self.playback_process = None
+        
+        self.stop_listening_flag = False
+        
+        self.last_recorded_audio = None
+        self.last_transcribed_text = None
     
     def _init_tts(self):
         if hasattr(self, 'tts_model') and self.tts_model is not None:
@@ -97,6 +102,16 @@ class VoiceHandler:
         audio_array = np.frombuffer(audio_data, dtype=np.int16)
         return np.abs(audio_array).mean()
     
+    def _calculate_db(self, audio_data):
+        import numpy as np
+        audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+        rms = np.sqrt(np.mean(audio_array**2))
+        if rms > 0:
+            db = 20 * np.log10(rms / 32768.0)
+        else:
+            db = -100
+        return db
+    
     def _calculate_frequency_energy(self, audio_data):
         audio_array = np.frombuffer(audio_data, dtype=np.int16)
         
@@ -106,52 +121,6 @@ class VoiceHandler:
         speech_energy = np.sum(power_spectrum[freq_mask])
         
         return speech_energy
-    
-    def check_for_speech(self, timeout: float = 1.5) -> bool:
-        if not self.default_input_device:
-            return False
-        
-        try:
-            stream = self.audio.open(
-                format=self.format,
-                channels=self.channels,
-                rate=self.rate,
-                input=True,
-                frames_per_buffer=self.chunk,
-                input_device_index=self.default_input_device['index']
-            )
-        except Exception as e:
-            logger.error(f"Failed to open audio stream: {e}")
-            return False
-        
-        start_time = time.time()
-        speech_detected = False
-        speech_frames = 0
-        required_speech_frames = 3
-        
-        try:
-            while time.time() - start_time < timeout:
-                try:
-                    data = stream.read(self.chunk, exception_on_overflow=False)
-                    amplitude = self._calculate_amplitude(data)
-                    freq_energy = self._calculate_frequency_energy(data)
-                    
-                    if amplitude > settings.silence_threshold * 1.5 and freq_energy > 2000:
-                        speech_frames += 1
-                        if speech_frames >= required_speech_frames:
-                            speech_detected = True
-                            break
-                    else:
-                        speech_frames = max(0, speech_frames - 1)
-                            
-                except Exception as e:
-                    logger.error(f"Error reading audio: {e}")
-                    break
-        finally:
-            stream.stop_stream()
-            stream.close()
-        
-        return speech_detected
     
     def _save_buffer_to_file(self, frames):
         try:
@@ -170,13 +139,59 @@ class VoiceHandler:
         except Exception as e:
             logger.error(f"Error saving audio file: {e}")
             return None
+        
+    def check_for_speech(self, timeout: float = 0.5) -> bool:
+        if not self.default_input_device:
+            return False
+        
+        try:
+            stream = self.audio.open(
+                format=self.format,
+                channels=self.channels,
+                rate=self.rate,
+                input=True,
+                frames_per_buffer=self.chunk,
+                input_device_index=self.default_input_device['index']
+            )
+        except Exception as e:
+            logger.error(f"Failed to open audio stream: {e}")
+            return False
+        
+        start_time = time.time()
+        speech_detected = False
+        
+        try:
+            while time.time() - start_time < timeout:
+                try:
+                    data = stream.read(self.chunk, exception_on_overflow=False)
+                except:
+                    continue
+                
+                db_level = self._calculate_db(data)
+                amplitude = self._calculate_amplitude(data)
+                freq_energy = self._calculate_frequency_energy(data)
+                
+                if db_level > -55 and (amplitude > settings.silence_threshold or freq_energy > 1000):
+                    speech_detected = True
+                    break
+        finally:
+            if stream.is_active():
+                stream.stop_stream()
+            stream.close()
+        
+        return speech_detected
     
     def listen_for_activation(self):
         if not self.default_input_device:
             logger.error("No input device available")
             return False
         
+        if self.stop_listening_flag:
+            return False
+        
         while self.stop_playback_flag or (hasattr(self, 'playback_process') and self.playback_process is not None):
+            if self.stop_listening_flag:
+                return False
             import time
             time.sleep(0.1)
             
@@ -195,135 +210,115 @@ class VoiceHandler:
         
         logger.info(f"Listening for activation phrase: '{settings.activation_phrase}'")
         
-        activation_confidence_threshold = 0.7
-        min_phrase_length = len(settings.activation_phrase) - 2
+        buffer_duration = 1.0
+        overlap_duration = 0.5
+        buffer_size = int(buffer_duration * self.rate / self.chunk)
+        overlap_size = int(overlap_duration * self.rate / self.chunk)
+        
+        buffers = []
+        current_buffer = []
+        activation_detected = False
+        activation_buffer_index = -1
+        silence_counter = 0
+        silence_chunks_threshold = int(1.5 * self.rate / self.chunk)
         
         try:
-            while True:
+            while not self.stop_listening_flag:
                 try:
                     data = stream.read(self.chunk, exception_on_overflow=False)
                 except Exception as e:
                     logger.error(f"Error reading audio: {e}")
                     continue
                 
-                amplitude = self._calculate_amplitude(data)
-                freq_energy = self._calculate_frequency_energy(data)
+                current_buffer.append(data)
                 
-                if amplitude < settings.silence_threshold * 0.5 and freq_energy < 500:
-                    continue
+                if len(current_buffer) >= buffer_size:
+                    buffers.append(list(current_buffer))
                     
-                self.audio_buffer.append(data)
-                
-                if len(self.audio_buffer) >= self.buffer_size:
-                    frames = list(self.audio_buffer)
-                    audio_path = self._save_buffer_to_file(frames)
-                    
-                    if not audio_path:
-                        continue
-                    
-                    try:
-                        text = self.asr_model.transcribe(audio_path).strip().lower()
-                        
-                        if len(text) >= min_phrase_length and settings.activation_phrase in text:
-                            phrase_words = settings.activation_phrase.split()
-                            text_words = text.split()
-                            
-                            max_extra_words = 5
-                            
-                            if len(text_words) <= len(phrase_words) + max_extra_words:
-                                activation_index = text.find(settings.activation_phrase)
-                                text_after_activation = text[activation_index + len(settings.activation_phrase):].strip()
-                                
-                                words_after = text_after_activation.split()
-                                if len(words_after) <= max_extra_words:
-                                    logger.info(f"Activation detected: {text}")
+                    if not activation_detected:
+                        temp_path = self._save_buffer_to_file(current_buffer)
+                        if temp_path:
+                            try:
+                                text = self.asr_model.transcribe(temp_path).strip().lower()
+                                if settings.activation_phrase in text:
+                                    activation_detected = True
+                                    activation_buffer_index = len(buffers) - 1
+                                    logger.info(f"Activation detected in buffer {activation_buffer_index}")
+                                    silence_counter = 0
+                            except Exception as e:
+                                logger.error(f"Transcription error: {e}")
+                            finally:
+                                if os.path.exists(temp_path):
                                     try:
-                                        os.unlink(audio_path)
+                                        os.unlink(temp_path)
                                     except:
                                         pass
-                                    stream.stop_stream()
-                                    stream.close()
-                                    
-                                    self.audio_buffer.clear()
-                                    
-                                    return True
-                        
-                    except Exception as e:
-                        logger.error(f"Transcription error: {e}")
-                    finally:
-                        if os.path.exists(audio_path):
-                            try:
-                                os.unlink(audio_path)
-                            except:
-                                pass
-        
-        except KeyboardInterrupt:
-            stream.stop_stream()
-            stream.close()
-            return False
-
-    def record_command(self):
-        if not self.default_input_device:
-            logger.error("No input device available")
-            return None
-            
-        try:
-            stream = self.audio.open(
-                format=self.format,
-                channels=self.channels,
-                rate=self.rate,
-                input=True,
-                frames_per_buffer=self.chunk,
-                input_device_index=self.default_input_device['index']
-            )
-        except Exception as e:
-            logger.error(f"Failed to open audio stream for recording: {e}")
-            return None
-        
-        logger.info("Recording command...")
-        frames = []
-        silence_counter = 0
-        has_speech = False
-        
-        try:
-            while True:
-                try:
-                    data = stream.read(self.chunk, exception_on_overflow=False)
-                except Exception as e:
-                    logger.error(f"Error reading audio: {e}")
-                    break
                     
-                frames.append(data)
+                    current_buffer = current_buffer[overlap_size:]
                 
-                amplitude = self._calculate_amplitude(data)
-                freq_energy = self._calculate_frequency_energy(data)
+                if activation_detected:
+                    db_level = self._calculate_db(data)
+                    
+                    if db_level <= -55:
+                        silence_counter += 1
+                    else:
+                        silence_counter = 0
+                    
+                    if silence_counter >= silence_chunks_threshold:
+                        logger.info("End of speech detected (silence below -55 dB)")
+                        break
                 
-                if amplitude > settings.silence_threshold and freq_energy > 1000:
-                    has_speech = True
-                    silence_counter = 0
-                elif amplitude < settings.silence_threshold and freq_energy < 1000:
-                    silence_counter += 1
-                else:
-                    silence_counter = 0
-                
-                if has_speech and silence_counter >= self.silence_chunks:
-                    logger.info("End of speech detected")
-                    break
-                
-                if len(frames) > self.rate / self.chunk * 10:
+                if len(buffers) > 15:
                     logger.info("Max recording time reached")
                     break
         
-        finally:
-            stream.stop_stream()
+        except KeyboardInterrupt:
+            if stream.is_active():
+                stream.stop_stream()
             stream.close()
+            return False
+        finally:
+            try:
+                if stream.is_active():
+                    stream.stop_stream()
+                stream.close()
+            except:
+                pass
         
-        if not has_speech:
-            logger.warning("No speech detected during recording")
-            return None
+        if not activation_detected:
+            logger.info("No activation detected")
+            return False
         
-        audio_path = self._save_buffer_to_file(frames)
-        return audio_path
+        final_frames = []
+        for i in range(activation_buffer_index, len(buffers)):
+            if i == activation_buffer_index:
+                final_frames.extend(buffers[i])
+            else:
+                final_frames.extend(buffers[i][overlap_size:])
+        
+        if current_buffer:
+            final_frames.extend(current_buffer)
+        
+        audio_path = self._save_buffer_to_file(final_frames)
+        
+        if not audio_path:
+            logger.info("No audio recorded")
+            return False
+        
+        user_text = self.transcribe(audio_path)
+        
+        words = user_text.strip().split()
+        if len(words) <= 1:
+            logger.info(f"False activation (only one word): {user_text}")
+            return False
+        
+        if user_text and len(user_text.strip()) > 2:
+            logger.info(f"User: {user_text}")
+            self.last_recorded_audio = audio_path
+            self.last_transcribed_text = user_text
+            return True
+        
+        return False
     
     def transcribe(self, audio_path):
         if not audio_path:
@@ -456,50 +451,43 @@ class VoiceHandler:
         return text
     
     def _clean_text_for_tts(self, text: str) -> str:
-        if self.tts_provider == "vosk":
-            text = re.sub(r'(\d+)[.,](\d+)', lambda m: f"{m.group(1)} запятая {m.group(2)}", text)
-            
-            text = re.sub(r'(\d+)\s*%', lambda m: f"{m.group(1)} процентов", text)
-            
-            text = re.sub(r'(\d+)\s*м/с', lambda m: f"{m.group(1)} метров в секунду", text)
-            
-            text = re.sub(r'(\d+)\s*мм рт\.?\s*ст\.?', lambda m: f"{m.group(1)} миллиметров ртутного столба", text)
-            
-            text = re.sub(r'[–−—]\s*(\d+)', r'минус \1', text)
-            
-            text = re.sub(r'°C|°С|℃|градусов Цельсия|градуса Цельсия|градус Цельсия', ' градусов цельсия', text, flags=re.IGNORECASE)
-            text = re.sub(r'°C|°С|°c|°с', ' градусов', text)
-            text = re.sub(r'°', ' градусов', text)
-            
-            
-            text = self._text_to_number_words(text)
-            
-            text = text.replace('—', '-')
-            text = text.replace('–', '-')
-            text = re.sub(r'\.\.\.', ' ', text)
-            text = re.sub(r'…', ' ', text)
-            
-            allowed_pattern = re.compile('[^а-яА-ЯёЁ0-9!.,:?\s-]')
-            text = allowed_pattern.sub('', text)
-            
-            text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'(\d+)[.,](\d+)', lambda m: f"{m.group(1)} запятая {m.group(2)}", text)
         
-        elif self.tts_provider == "xtts":
-            text = re.sub(r'[–−—]\s*(\d+)', r'минус \1', text)
-            
-            text = re.sub(r'°C|°С|℃', ' градусов Цельсия', text, flags=re.IGNORECASE)
-            text = re.sub(r'°', ' градусов', text)
-            
-            text = re.sub(r'\.\.\.', ' ', text)
-            text = re.sub(r'…', ' ', text)
-            
-            text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'(\d+)\s*%', lambda m: f"{m.group(1)} процентов", text)
+        
+        text = re.sub(r'(\d+)\s*м/с', lambda m: f"{m.group(1)} метров в секунду", text)
+        
+        text = re.sub(r'(\d+)\s*мм рт\.?\s*ст\.?', lambda m: f"{m.group(1)} миллиметров ртутного столба", text)
+
+        text = re.sub(r'[–−—]\s*(\d+)', r'минус \1', text)
+        
+        text = re.sub(r'°C|°С|℃|градусов Цельсия|градуса Цельсия|градус Цельсия', ' градусов цельсия', text, flags=re.IGNORECASE)
+        text = re.sub(r'°C|°С|°c|°с', ' градусов', text)
+        text = re.sub(r'°', ' градусов', text)
+        
+        
+        text = self._text_to_number_words(text)
+        
+        text = text.replace('—', ' ')
+        text = text.replace('–', ' ')
+        text = re.sub(r'\.\.\.', ' ', text)
+        text = re.sub(r'…', ' ', text)
+        
+        text = re.sub(r'\s+', ' ', text)
+        
+        if self.tts_provider == "vosk":
+            allowed_pattern = re.compile('[^а-яА-ЯёЁ0-9!.,:?\s‐-]')
+            text = allowed_pattern.sub('', text)
         
         return text.strip()
-    
+
     def speak(self, text):
         if not self.tts_model:
             logger.info(f"TTS unavailable. Text: {text}")
+            return
+        
+        if self.stop_playback_flag:
+            logger.info("Playback stopped before speaking")
             return
             
         temp_audio_path = None
@@ -546,7 +534,7 @@ class VoiceHandler:
                     except Exception as e:
                         logger.error(f"Error deleting temp audio file: {e}")
                         break
-    
+
     def _play_audio(self, file_path):
         try:
             import platform
@@ -626,12 +614,34 @@ class VoiceHandler:
             logger.error(f"Audio playback error: {e}")
         finally:
             self.playback_process = None
-    
+
     def cleanup(self):
         try:
+            self.stop_listening_flag = True
+            self.stop_playback_flag = True
+            
             if hasattr(self, 'playback_audio') and self.playback_audio:
                 self.playback_audio.terminate()
                 self.playback_audio = None
+            
+            if hasattr(self, 'playback_process') and self.playback_process:
+                try:
+                    self.playback_process.terminate()
+                    self.playback_process.wait(timeout=0.5)
+                except:
+                    pass
+                self.playback_process = None
+            
+            import platform
+            if platform.system() == "Windows":
+                try:
+                    if hasattr(self, 'pygame_initialized') and self.pygame_initialized:
+                        import pygame
+                        pygame.mixer.music.stop()
+                        pygame.mixer.quit()
+                        self.pygame_initialized = False
+                except:
+                    pass
                 
             if hasattr(self, 'audio') and self.audio:
                 self.audio.terminate()

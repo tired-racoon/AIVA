@@ -7,6 +7,7 @@ class Settings(BaseModel):
     music_provider: Literal["yandex"] = "yandex"
     search_provider: Literal["duckduckgo"] = "duckduckgo"
     
+    use_langgraph: bool = True
     streaming_enabled: bool = True
     
     local_model_name: str = "Qwen/Qwen3-0.6B"

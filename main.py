@@ -32,27 +32,34 @@ def run_voice_mode(assistant):
                 
                 assistant.voice_handler.speak("Слушаю")
                 
-                audio_path = assistant.voice_handler.record_command()
+                user_text = assistant.voice_handler.last_transcribed_text
                 
-                if not audio_path:
-                    logger.info("No audio recorded")
-                    if music_was_playing:
-                        assistant.tool_executor.tools["music"].provider.resume_music()
-                    continue
+                logger.info(f"User: {user_text}")
                 
-                user_text = assistant.voice_handler.transcribe(audio_path)
+                response = assistant.process_message(user_text, skip_llm_after_tools=False)
+                logger.info(f"Assistant: {response}")
                 
-                if user_text and len(user_text.strip()) > 2:
-                    logger.info(f"User: {user_text}")
-                    
-                    is_music_command = any(word in user_text.lower() for word in 
-                                        ['включи', 'поставь', 'воспроизведи', 'играй', 'музыка', 'трек', 'песня', 'исполнител', 'альбом', 'лайк'])
-                    
-                    response = assistant.process_message(user_text, skip_llm_after_tools=is_music_command)
-                    logger.info(f"Assistant: {response}")
-                    
-                    if not is_music_command or "ошибка" in response.lower() or "не удалось" in response.lower():
-                        assistant.voice_handler.speak(response)
+                if response and response.strip():
+                    assistant.voice_handler.speak(response)
+                
+                wait_start = time.time()
+                while time.time() - wait_start < 3.0:
+                    if assistant.voice_handler.check_for_speech(timeout=0.5):
+                        logger.info("User continues conversation")
+                        
+                        if assistant.voice_handler.listen_for_activation():
+                            user_text = assistant.voice_handler.last_transcribed_text
+                            logger.info(f"User continues: {user_text}")
+                            response = assistant.process_message(user_text)
+                            logger.info(f"Assistant: {response}")
+                            if response and response.strip():
+                                assistant.voice_handler.speak(response)
+                            wait_start = time.time()
+                    time.sleep(0.1)
+                
+                logger.info("Conversation ended, resetting history")
+                assistant.conversation_history = []
+                assistant._update_system_prompt()
                 
                 if music_was_playing:
                     assistant.tool_executor.tools["music"].provider.resume_music()
@@ -60,6 +67,7 @@ def run_voice_mode(assistant):
     except KeyboardInterrupt:
         logger.info("Voice assistant stopped by user")
     finally:
+        assistant.set_voice_mode(False)
         assistant.cleanup()
 
 def run_text_mode(assistant):

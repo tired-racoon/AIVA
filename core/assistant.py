@@ -1,5 +1,6 @@
 from typing import List, Dict, Any
 from core import get_provider, ToolExecutor
+from core.graph_executor import LangGraphExecutor
 from core.voice_handler import VoiceHandler
 from config.settings import settings
 from utils import setup_logger
@@ -8,8 +9,19 @@ from prompts import BASE_SYSTEM_PROMPT, VOICE_SYSTEM_PROMPT
 logger = setup_logger(__name__)
 
 class Assistant:
-    def __init__(self):
-        self.tool_executor = ToolExecutor()
+    def __init__(self, use_langgraph: bool = None):
+        if use_langgraph is None:
+            use_langgraph = settings.use_langgraph
+        
+        self.use_langgraph = use_langgraph
+        
+        if use_langgraph:
+            self.graph_executor = LangGraphExecutor()
+            self.tool_executor = self.graph_executor
+        else:
+            self.tool_executor = ToolExecutor()
+            self.graph_executor = None
+        
         self.voice_handler = VoiceHandler()
         self.conversation_history: List[Dict[str, Any]] = []
         self.voice_mode = False
@@ -25,12 +37,17 @@ class Assistant:
         }
         self.conversation_history.append(system_message)
         
-        logger.info("Assistant initialized")
+        logger.info(f"Assistant initialized (LangGraph: {use_langgraph})")
 
     def set_voice_mode(self, enabled: bool):
         self.voice_mode = enabled
+        self.conversation_history = []
         self._update_system_prompt()
-        logger.info(f"Voice mode set to: {enabled}")
+        
+        from core.llm_provider import clear_provider_cache
+        clear_provider_cache()
+        
+        logger.info(f"Voice mode set to: {enabled}, conversation history cleared, LLM cache cleared")
 
     def _get_location_info(self) -> str:
         try:
@@ -50,8 +67,10 @@ class Assistant:
         
         if self.voice_mode:
             base_prompt = VOICE_SYSTEM_PROMPT
+            logger.info("Using VOICE_SYSTEM_PROMPT")
         else:
             base_prompt = BASE_SYSTEM_PROMPT
+            logger.info("Using BASE_SYSTEM_PROMPT")
         
         full_prompt = f"{location_info}\n\n{base_prompt}"
         
@@ -67,28 +86,48 @@ class Assistant:
                 self.conversation_history[0:0] = [system_message]
             else:
                 self.conversation_history.append(system_message)
+        
+        logger.debug(f"System prompt updated. First 200 chars: {full_prompt[:200]}")
     
     def _get_provider(self):
         from core import get_provider
         return get_provider()
     
     def _handle_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> str:
-        results = []
-        for tool_call in tool_calls:
-            function_name = tool_call["function"]
-            arguments = tool_call["arguments"]
+        if self.use_langgraph:
+            return self.graph_executor.execute_with_graph(tool_calls)
+        else:
+            results = []
+            for tool_call in tool_calls:
+                function_name = tool_call["function"]
+                arguments = tool_call["arguments"]
+                
+                logger.info(f"Executing tool: {function_name} with args: {arguments}")
+                result = self.tool_executor.execute_tool_call(function_name, arguments)
+                results.append(f"[{function_name}]: {result}")
             
-            logger.info(f"Executing tool: {function_name} with args: {arguments}")
-            result = self.tool_executor.execute_tool_call(function_name, arguments)
-            results.append(f"[{function_name}]: {result}")
+            return "\n".join(results)
+    
+    def _is_music_action(self, tool_calls: List[Dict[str, Any]]) -> bool:
+        if not tool_calls:
+            return False
         
-        return "\n".join(results)
+        music_actions = ['play_track', 'play_artist', 'play_album', 'play_likes']
+        
+        for tool_call in tool_calls:
+            if tool_call.get("function") == "music":
+                action = tool_call.get("arguments", {}).get("action", "")
+                if action in music_actions:
+                    return True
+        
+        return False
     
     def process_message(self, user_message: str, skip_llm_after_tools: bool = False) -> str:
         from config.settings import get_settings
         settings = get_settings()
         
         logger.info(f"Processing message: {user_message}")
+        logger.info(f"Voice mode: {self.voice_mode}")
         
         location_info = self._get_location_info()
         
@@ -99,7 +138,11 @@ class Assistant:
             "content": user_info + user_message
         })
         
+        if self.conversation_history and self.conversation_history[0].get("role") == "system":
+            logger.debug(f"Current system prompt (first 300 chars): {self.conversation_history[0]['content'][:300]}")
+        
         tools = self.tool_executor.get_tools_definition()
+        
         max_iterations = 5
         iteration = 0
         
@@ -165,6 +208,8 @@ class Assistant:
                 if response.get("tool_calls"):
                     logger.info(f"Tool calls detected: {response['tool_calls']}")
                     
+                    is_music_play = self._is_music_action(response["tool_calls"])
+                    
                     tool_results = self._handle_tool_calls(response["tool_calls"])
                     
                     if response.get("content"):
@@ -173,8 +218,8 @@ class Assistant:
                             "content": response["content"]
                         })
                     
-                    if skip_llm_after_tools:
-                        logger.info("Skipping LLM call after tool execution (skip_llm_after_tools=True)")
+                    if skip_llm_after_tools or is_music_play:
+                        logger.info(f"Skipping LLM call after tool execution (music_play={is_music_play}, skip_flag={skip_llm_after_tools})")
                         return tool_results
                     
                     self.conversation_history.append({
@@ -202,8 +247,9 @@ class Assistant:
                                     "content": content
                                 })
                                 
-                                if skip_llm_after_tools:
-                                    logger.info("Skipping LLM call after tool execution (skip_llm_after_tools=True)")
+                                is_music_play = self._is_music_action([parsed])
+                                if skip_llm_after_tools or is_music_play:
+                                    logger.info(f"Skipping LLM call after tool execution (music_play={is_music_play})")
                                     return tool_results
                                 
                                 self.conversation_history.append({
