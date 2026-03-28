@@ -1,0 +1,2 @@
+from .base_prompt import BASE_SYSTEM_PROMPT
+from .voice_prompt import VOICE_SYSTEM_PROMPT
